@@ -20,16 +20,19 @@ from torchao.core.config import (
     config_from_dict,
     config_to_dict,
 )
+from torchao.float8 import Float8LinearConfig
 from torchao.prototype.awq import (
     AWQConfig,
 )
 from torchao.prototype.mx_formats import MXDynamicActivationMXWeightConfig
+from torchao.prototype.qat import MXFakeQuantizeConfig
 from torchao.quantization import (
     PerBlock,
     PerGroup,
     PerRow,
     PerTensor,
 )
+from torchao.quantization.qat import QATConfig
 from torchao.quantization.quant_api import (
     Float8DynamicActivationFloat8WeightConfig,
     Float8DynamicActivationInt4WeightConfig,
@@ -81,6 +84,8 @@ configs = [
     ),
     AWQConfig(Int4WeightOnlyConfig(group_size=128), step="prepare_for_loading"),
     MXDynamicActivationMXWeightConfig(),
+    Float8LinearConfig(),
+    MXFakeQuantizeConfig(),
 ]
 
 
@@ -245,6 +250,45 @@ def test_default_version():
 
     config = DummyConfig()
     assert config.version == 1, "Default version must be 1"
+
+
+def test_float8_linear_config_contract():
+    """Float8LinearConfig enters the AOBaseConfig contract: it inherits the
+    base class, carries the default version, and round-trips through
+    config_to_dict/config_from_dict with all nested fields preserved.
+    """
+    config = Float8LinearConfig()
+    assert isinstance(config, AOBaseConfig)
+    assert config.version == 1
+
+    reconstructable = config_to_dict(config)
+    assert reconstructable["_type"] == "Float8LinearConfig"
+
+    reconstructed = config_from_dict(reconstructable)
+    assert isinstance(reconstructed, Float8LinearConfig)
+    assert reconstructed == config
+
+
+def test_qat_subconfig_contract():
+    """QAT sub-configs (FakeQuantizeConfigBase family) enter the AOBaseConfig
+    contract: they serialize on their own and round-trip inside a QATConfig.
+    """
+    subconfig = MXFakeQuantizeConfig()
+    assert isinstance(subconfig, AOBaseConfig)
+
+    reconstructable = config_to_dict(subconfig)
+    assert reconstructable["_type"] == "MXFakeQuantizeConfig"
+    reconstructed = config_from_dict(reconstructable)
+    assert isinstance(reconstructed, MXFakeQuantizeConfig)
+    assert reconstructed == subconfig
+
+    qat_config = QATConfig(weight_config=MXFakeQuantizeConfig(), step="prepare")
+    reconstructable = config_to_dict(qat_config)
+    reconstructed = config_from_dict(reconstructable)
+    assert isinstance(reconstructed, QATConfig)
+    assert isinstance(reconstructed.weight_config, MXFakeQuantizeConfig)
+    assert reconstructed.weight_config == qat_config.weight_config
+    assert reconstructed.step == "prepare"
 
 
 def test_mxconfig_include_pybind11_enum_serialization():

@@ -11,6 +11,7 @@ from typing import Optional, Union
 
 import torch
 
+from torchao.core.config import AOBaseConfig
 from torchao.utils import is_MI300
 
 logger: logging.Logger = logging.getLogger()
@@ -177,7 +178,7 @@ class Float8LinearRecipeName(enum.Enum):
 
 
 @dataclass(frozen=True)
-class Float8LinearConfig:
+class Float8LinearConfig(AOBaseConfig):
     """
     Configuration for converting a `torch.nn.Linear` module to float8
     for training.
