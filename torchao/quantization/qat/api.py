@@ -104,10 +104,10 @@ class QATConfig(AOBaseConfig):
         base_config (Optional[AOBaseConfig]): Base PTQ config to infer the fake
             quantization configs during the prepare phase, and to apply directly
             during the convert phase.
-        activation_config (Optional[FakeQuantizeConfigBase]): Custom fake
+        activation_config (Optional[AOBaseConfig]): Custom fake
             quantization config for input activations, always optional.
             Must be None if `base_config` is used.
-        weight_config (Optional[FakeQuantizeConfigBase]): Custom fake quantization
+        weight_config (Optional[AOBaseConfig]): Custom fake quantization
             config for weights. Must be None if `base_config` is used.
 
     Keyword args:
@@ -127,8 +127,8 @@ class QATConfig(AOBaseConfig):
     """
 
     base_config: Optional[AOBaseConfig]
-    activation_config: Optional[FakeQuantizeConfigBase]
-    weight_config: Optional[FakeQuantizeConfigBase]
+    activation_config: Optional[AOBaseConfig]
+    weight_config: Optional[AOBaseConfig]
     step: QATStep
 
     # Express `step` as a keyword argument
@@ -136,8 +136,8 @@ class QATConfig(AOBaseConfig):
     def __init__(
         self,
         base_config: Optional[AOBaseConfig] = None,
-        activation_config: Optional[FakeQuantizeConfigBase] = None,
-        weight_config: Optional[FakeQuantizeConfigBase] = None,
+        activation_config: Optional[AOBaseConfig] = None,
+        weight_config: Optional[AOBaseConfig] = None,
         *,
         step: QATStep = "prepare",
     ):

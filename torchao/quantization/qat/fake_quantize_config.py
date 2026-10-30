@@ -4,7 +4,6 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import abc
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
 
@@ -38,9 +37,15 @@ from torchao.utils import _is_float8_type
 from .utils import _log_deprecation_warning
 
 
-class FakeQuantizeConfigBase(abc.ABC):
+class FakeQuantizeConfigBase(AOBaseConfig):
     """
     Base class for representing fake quantization config.
+
+    Inherits from :class:`AOBaseConfig` so that fake quantization configs,
+    while not workflow entry points on their own, still participate in the
+    ``AOBaseConfig`` contract: they serialize through
+    ``config_to_dict``/``config_from_dict`` and can be carried inside a
+    ``QATConfig`` with a round-trip guarantee.
     """
 
     pass
