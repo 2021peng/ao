@@ -8,9 +8,9 @@
 from typing import Tuple
 
 import torch
-from torch.utils._triton import has_triton
+from torch.utils._triton import has_triton_package
 
-if has_triton():
+if has_triton_package():
     import triton
     import triton.language as tl
 
@@ -193,8 +193,7 @@ if has_triton():
 
         # compute global scales using atomics with local scales - shape (1, K)
         scales_offs = (
-            expert_idx[:, None] * stride_scales_dim0
-            + k_offs[None, :] * stride_scales_dim1
+            expert_idx * stride_scales_dim0 + k_offs[None, :] * stride_scales_dim1
         )
         scales_mask = k_offs[None, :] < K
         # AMD GPUs need relaxed semantics for better performance
@@ -253,8 +252,7 @@ if has_triton():
 
         # load global scales for this block of the given expert - shape (1, K)
         scales_offs = (
-            expert_idx[:, None] * stride_scales_dim0
-            + k_offs[None, :] * stride_scales_dim1
+            expert_idx * stride_scales_dim0 + k_offs[None, :] * stride_scales_dim1
         )
         scales_mask = k_offs[None, :] < K
         scales = tl.load(scales_ptr + scales_offs, mask=scales_mask, other=0.0)

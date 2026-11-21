@@ -22,10 +22,10 @@ jobs:
         include:
           - name: ROCM Nightly
             runs-on: linux.rocm.gpu.ecosystem.mi350.1
-            torch-spec: '--pre torchvision torch --index-url https://download.pytorch.org/whl/nightly/rocm10.0'
+            torch-spec: '--pre torchvision torch --index-url https://download.pytorch.org/whl/nightly/rocm10.1'
             gpu-arch-type: "rocm"
-            gpu-arch-version: "10.0"
-            docker-image: pytorch/manylinux2_28-builder:rocm10.0
+            gpu-arch-version: "10.1"
+            docker-image: pytorch/manylinux2_28-builder:rocm10.1
 
     permissions:
       id-token: write
@@ -40,11 +40,12 @@ jobs:
       docker-image: ${{ matrix.docker-image }}
       submodules: recursive
       script: |
-        conda create -n venv python=3.10 -y
+        conda create -n venv python=3.11 -y
         conda activate venv
         python -m pip install --upgrade pip
         pip install ${{ matrix.torch-spec }}
-        pip install -r dev-requirements.txt
+        pip install uv==0.13.7
+        uv pip install -r dev-requirements.txt
         # Editable install so build_ext --inplace drops the compiled extensions
         # (e.g. the hipified torchao/_C*.so providing torchao::swizzle_mm) into the
         # in-tree torchao/ dir. pytest is run from the repo root and, because test/ is
@@ -58,6 +59,6 @@ jobs:
         export LD_LIBRARY_PATH=$CONDA/lib/:$LD_LIBRARY_PATH
         # PT2E tests (test/quantization/pt2e) are excluded here -- they are slow
         # and CPU/x86-centric (the x86 Inductor tests self-skip on ROCm anyway).
-        # PT2E now runs in dedicated workflows: regression_test_pt2e_cpu.yml and
-        # regression_test_pt2e_gpu.yml.
+        # CPU PT2E lives in regression_test_pt2e_cpu.yml; GPU PT2E is CUDA-only
+        # in regression_test_pt2e_gpu.yml (no ROCm PT2E leg).
         pytest test --verbose -s --ignore=test/quantization/pt2e

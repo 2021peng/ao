@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
+# Copyright 2026 Arm Limited and/or its affiliates.
+#
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -3192,6 +3193,394 @@ class TestQAT(TestCase):
         torch.testing.assert_close(m.sub.linear.weight.scale, sub_scale)
 
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    @parametrize("bias", [True, False])
+    @parametrize(
+        "input_shape,out_channels,groups",
+        [
+            ((64, 8, 8), 32, 1),
+            ((2, 64, 8, 10), 64, 1),
+            ((1, 64, 10, 6), 32, 2),
+        ],
+    )
+    @parametrize(
+        "dtype",
+        [torch.float4_e2m1fn_x2, torch.float8_e4m3fn, torch.float8_e5m2],
+    )
+    def test_mx_fake_quantized_conv2d_forward(
+        self, bias, input_shape, out_channels, groups, dtype
+    ):
+        """Test MX Conv2d forward with supported dtypes and input ranks."""
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        activation_config = MXFakeQuantizeConfig(dtype=dtype, block_size=32)
+        weight_config = MXFakeQuantizeConfig(dtype=dtype, block_size=32)
+        conv = torch.nn.Conv2d(
+            64,
+            out_channels,
+            3,
+            padding=1,
+            groups=groups,
+            bias=bias,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        fq_conv = MXFakeQuantizedConv2d.from_conv2d(
+            conv,
+            activation_config=activation_config,
+            weight_config=weight_config,
+        )
+        x = torch.randn(*input_shape, device="cuda", dtype=torch.bfloat16)
+
+        expected = conv(x)
+        actual = fq_conv(x)
+
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertEqual(actual.dtype, expected.dtype)
+        sqnr = compute_error(expected, actual)
+        if dtype == torch.float4_e2m1fn_x2:
+            self.assertGreaterEqual(sqnr, 5.0)
+        else:
+            self.assertGreaterEqual(sqnr, 10.0)
+
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    @parametrize("memory_format", [torch.contiguous_format, torch.channels_last])
+    def test_mx_fake_quantized_conv2d_preserves_memory_format(self, memory_format):
+        """Test that MX Conv2d fake quantization preserves memory format."""
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        config = MXFakeQuantizeConfig(block_size=32)
+        conv = torch.nn.Conv2d(
+            64,
+            32,
+            3,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).to(memory_format=memory_format)
+        fq_conv = MXFakeQuantizedConv2d.from_conv2d(
+            conv,
+            activation_config=config,
+            weight_config=config,
+        )
+        x = torch.randn(2, 64, 8, 8, device="cuda", dtype=torch.bfloat16).contiguous(
+            memory_format=memory_format
+        )
+
+        quantized_input = fq_conv._fake_quantize_input_channel_blocks(x, config)
+        quantized_weight = fq_conv._fake_quantize_input_channel_blocks(
+            fq_conv.weight, config
+        )
+
+        self.assertTrue(quantized_input.is_contiguous(memory_format=memory_format))
+        self.assertTrue(quantized_weight.is_contiguous(memory_format=memory_format))
+
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    @parametrize("bias", [True, False])
+    def test_mx_fake_quantized_conv2d_backward(self, bias):
+        """Test MX Conv2d backward against the analytic STE result."""
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        config = MXFakeQuantizeConfig(block_size=32)
+        conv = torch.nn.Conv2d(
+            64,
+            32,
+            3,
+            padding=1,
+            bias=bias,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        fq_conv = MXFakeQuantizedConv2d.from_conv2d(conv, config, config)
+        x = torch.randn(
+            2, 64, 8, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        grad_output = torch.randn(2, 32, 8, 8, device="cuda", dtype=torch.bfloat16)
+
+        quantized_input = fq_conv._fake_quantize_input_channel_blocks(
+            x, config
+        ).requires_grad_()
+        quantized_weight = fq_conv._fake_quantize_input_channel_blocks(
+            fq_conv.weight, config
+        ).requires_grad_()
+        reference_bias = (
+            fq_conv.bias.detach().clone().requires_grad_()
+            if fq_conv.bias is not None
+            else None
+        )
+        F.conv2d(
+            quantized_input,
+            quantized_weight,
+            reference_bias,
+            stride=fq_conv.stride,
+            padding=fq_conv.padding,
+            dilation=fq_conv.dilation,
+            groups=fq_conv.groups,
+        ).backward(grad_output)
+        fq_conv(x).backward(grad_output)
+
+        self.assertIsNotNone(x.grad)
+        self.assertIsNotNone(fq_conv.weight.grad)
+        torch.testing.assert_close(x.grad, quantized_input.grad)
+        torch.testing.assert_close(fq_conv.weight.grad, quantized_weight.grad)
+        if bias:
+            self.assertIsNotNone(fq_conv.bias.grad)
+            self.assertIsNotNone(reference_bias)
+            torch.testing.assert_close(fq_conv.bias.grad, reference_bias.grad)
+
+    def test_mx_fake_quantized_conv2d_quantizes_input_channel_axis(self):
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        config = MXFakeQuantizeConfig(block_size=4)
+        fq_conv = MXFakeQuantizedConv2d.from_conv2d(
+            torch.nn.Conv2d(4, 4, 1),
+            activation_config=config,
+            weight_config=config,
+        )
+        tensor = (
+            torch.arange(1, 17, dtype=torch.float32)
+            .reshape(1, 4, 2, 2)
+            .requires_grad_()
+        )
+        expected = torch.empty_like(tensor)
+        for batch in range(tensor.shape[0]):
+            for height in range(tensor.shape[2]):
+                for width in range(tensor.shape[3]):
+                    channel_block = tensor.detach()[
+                        batch, :, height, width
+                    ].contiguous()
+                    expected[batch, :, height, width] = MXTensor.to_mx(
+                        channel_block,
+                        elem_dtype=config.dtype,
+                        block_size=config.block_size,
+                        scaling_mode=config.scaling_mode,
+                        kernel_preference=config.kernel_preference,
+                    ).dequantize()
+
+        actual = fq_conv._fake_quantize_input_channel_blocks(tensor, config)
+
+        torch.testing.assert_close(actual, expected)
+        self.assertFalse(actual.requires_grad)
+
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    def test_mx_conv2d_training_simulation(self):
+        """Simulate a short training loop with MX Conv2d QAT."""
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        config = MXFakeQuantizeConfig(block_size=32)
+        model = torch.nn.Sequential(
+            torch.nn.Conv2d(32, 16, 3, bias=True, device="cuda", dtype=torch.bfloat16)
+        )
+        mx_model = torch.nn.Sequential(
+            MXFakeQuantizedConv2d.from_conv2d(model[0], config, config)
+        )
+        optimizer = torch.optim.SGD(mx_model.parameters(), lr=0.01)
+        initial_weight = mx_model[0].weight.detach().clone()
+
+        for _ in range(5):
+            x = torch.randn(2, 32, 8, 8, device="cuda", dtype=torch.bfloat16)
+            target = torch.randn(2, 16, 6, 6, device="cuda", dtype=torch.bfloat16)
+            optimizer.zero_grad()
+            output = mx_model(x)
+            torch.nn.functional.mse_loss(output, target).backward()
+            optimizer.step()
+
+        self.assertFalse(torch.allclose(mx_model[0].weight, initial_weight))
+
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    def test_mx_fake_quantized_conv2d_to_conv2d(self):
+        """Test converting MXFakeQuantizedConv2d back to nn.Conv2d."""
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        config = MXFakeQuantizeConfig(block_size=32)
+        original_conv = torch.nn.Conv2d(
+            64,
+            32,
+            (3, 5),
+            stride=(1, 2),
+            padding=(1, 2),
+            dilation=(1, 2),
+            groups=2,
+            bias=True,
+            padding_mode="reflect",
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        fq_conv = MXFakeQuantizedConv2d.from_conv2d(
+            original_conv,
+            activation_config=config,
+            weight_config=config,
+        )
+
+        converted_conv = fq_conv.to_conv2d()
+
+        self.assertIsInstance(converted_conv, torch.nn.Conv2d)
+        self.assertEqual(converted_conv.in_channels, original_conv.in_channels)
+        self.assertEqual(converted_conv.out_channels, original_conv.out_channels)
+        self.assertEqual(converted_conv.kernel_size, original_conv.kernel_size)
+        self.assertEqual(converted_conv.stride, original_conv.stride)
+        self.assertEqual(converted_conv.padding, original_conv.padding)
+        self.assertEqual(converted_conv.dilation, original_conv.dilation)
+        self.assertEqual(converted_conv.groups, original_conv.groups)
+        self.assertEqual(converted_conv.padding_mode, original_conv.padding_mode)
+        self.assertIs(converted_conv.weight, fq_conv.weight)
+        self.assertIs(converted_conv.bias, fq_conv.bias)
+
+    def test_mx_conv2d_config_error_handling(self):
+        """Test required MX Conv2d fake-quantize configs."""
+        from torchao.prototype.mx_formats import MXDynamicActivationMXWeightConfig
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Must specify `weight_config`"):
+            MXFakeQuantizedConv2d(
+                32,
+                32,
+                3,
+                activation_config=MXFakeQuantizeConfig(),
+                weight_config=None,
+            )
+
+        with self.assertRaisesRegex(ValueError, "Weight only MX QAT not supported yet"):
+            MXFakeQuantizedConv2d(
+                32,
+                32,
+                3,
+                activation_config=None,
+                weight_config=MXFakeQuantizeConfig(),
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Input channels per group must be divisible by the activation block size",
+        ):
+            MXFakeQuantizedConv2d.from_conv2d(
+                torch.nn.Conv2d(48, 6, 3),
+                activation_config=MXFakeQuantizeConfig(),
+                weight_config=MXFakeQuantizeConfig(),
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Input channels per group must be divisible by the activation block size",
+        ):
+            MXFakeQuantizedConv2d.from_conv2d(
+                torch.nn.Conv2d(64, 64, 3, groups=2),
+                activation_config=MXFakeQuantizeConfig(block_size=64),
+                weight_config=MXFakeQuantizeConfig(),
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "Input channels per group must be divisible"
+        ):
+            MXFakeQuantizedConv2d.from_conv2d(
+                torch.nn.Conv2d(64, 64, 3, groups=2),
+                activation_config=MXFakeQuantizeConfig(),
+                weight_config=MXFakeQuantizeConfig(block_size=64),
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "only supports torch.float32 and torch.bfloat16 weights",
+        ):
+            quantize_(
+                torch.nn.Conv2d(32, 32, 3, dtype=torch.float16),
+                QATConfig(
+                    activation_config=MXFakeQuantizeConfig(),
+                    weight_config=MXFakeQuantizeConfig(),
+                    step="prepare",
+                ),
+                lambda module, _: isinstance(module, torch.nn.Conv2d),
+            )
+
+        with self.assertRaisesRegex(ValueError, "explicit fake-quantize configs"):
+            quantize_(
+                torch.nn.Conv2d(32, 32, 3),
+                QATConfig(MXDynamicActivationMXWeightConfig(), step="prepare"),
+                lambda module, _: isinstance(module, torch.nn.Conv2d),
+            )
+
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    def test_quantize_api_mx_conv2d(self):
+        """Test the explicit-config MX Conv2d prepare and convert workflow."""
+        from torchao.prototype.mx_formats import MXDynamicActivationMXWeightConfig
+        from torchao.prototype.mx_formats.config import ScaleCalculationMode
+        from torchao.prototype.qat import (
+            MXFakeQuantizeConfig,
+            MXFakeQuantizedConv2d,
+        )
+
+        model = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                64,
+                32,
+                3,
+                padding=1,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+        )
+        reference = copy.deepcopy(model)
+        original_weight = model[0].weight
+        activation_config = MXFakeQuantizeConfig(
+            dtype=torch.float8_e4m3fn,
+            block_size=16,
+            scaling_mode=ScaleCalculationMode.FLOOR,
+        )
+        weight_config = MXFakeQuantizeConfig(
+            dtype=torch.float8_e5m2,
+            block_size=32,
+            scaling_mode=ScaleCalculationMode.CEIL,
+        )
+        conv_filter = lambda module, _: isinstance(module, torch.nn.Conv2d)
+        x = torch.randn(2, 64, 8, 8, device="cuda", dtype=torch.bfloat16)
+
+        quantize_(
+            model,
+            QATConfig(
+                activation_config=activation_config,
+                weight_config=weight_config,
+                step="prepare",
+            ),
+            conv_filter,
+        )
+
+        self.assertIsInstance(model[0], MXFakeQuantizedConv2d)
+        prepared_sqnr = compute_error(reference(x), model(x))
+        self.assertGreaterEqual(prepared_sqnr, 10.0)
+        with self.assertRaisesRegex(ValueError, "does not accept a base config"):
+            quantize_(
+                copy.deepcopy(model),
+                QATConfig(MXDynamicActivationMXWeightConfig(), step="convert"),
+                conv_filter,
+            )
+
+        quantize_(model, QATConfig(step="convert"), conv_filter)
+
+        self.assertIs(type(model[0]), torch.nn.Conv2d)
+        self.assertIs(model[0].weight, original_weight)
+        torch.testing.assert_close(model(x), reference(x))
+
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     def test_mx_fake_quantize_config(self):
         """Test MXFakeQuantizeConfig dataclass with various element dtypes."""
         from torchao.prototype.mx_formats.config import ScaleCalculationMode
@@ -3368,14 +3757,123 @@ class TestQAT(TestCase):
                 weight_config=None,
             )
 
-        with self.assertRaisesRegex(ValueError, "Weight only MX QAT not supported yet"):
-            MXFakeQuantizedLinear(
-                256,
-                128,
-                bias=True,
-                activation_config=None,
-                weight_config=MXFakeQuantizeConfig(),
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    @parametrize("bias", [True, False])
+    @parametrize("input_shape", [(128, 256), (2, 64, 256)])
+    @parametrize(
+        "dtype",
+        [torch.float4_e2m1fn_x2, torch.float8_e4m3fn],
+    )
+    def test_mx_weight_only_linear(self, bias, input_shape, dtype):
+        """Weight-only MX QAT: activation_config=None keeps the activations
+        in high precision; forward is a high precision matmul over the
+        weight fake quantized to the MX grid (covers W4A16 and W8A16
+        shapes), and backward keeps the STE semantics of the dual-sided
+        path.
+
+        The weight-only path only uses pure torch ops (to_mx, dequantize,
+        addmm/mm) and does not go through _addmm_mx_dispatch, but it follows
+        the cuda-only convention of the other MX tests in this file."""
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+        from torchao.prototype.qat import MXFakeQuantizeConfig, MXFakeQuantizedLinear
+
+        K, N = 256, 128
+        weight_config = MXFakeQuantizeConfig(
+            dtype=dtype,
+            block_size=32,
+        )
+
+        linear = torch.nn.Linear(K, N, bias=bias, device="cuda", dtype=torch.bfloat16)
+        mx_linear = MXFakeQuantizedLinear.from_linear(
+            linear,
+            activation_config=None,
+            weight_config=weight_config,
+        )
+        self.assertIsNone(mx_linear.activation_config)
+
+        # forward: the implementation runs the same ops on the same inputs
+        # as the reference below, so the outputs are bitwise identical
+        x = torch.randn(
+            *input_shape, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        y = mx_linear(x)
+
+        # reference: weight on the same MX grid then dequantized, activations
+        # untouched, high precision 2-d matmul (same ops as the implementation)
+        w_ref = MXTensor.to_mx(
+            linear.weight,
+            weight_config.dtype,
+            block_size=weight_config.block_size,
+            scaling_mode=weight_config.scaling_mode,
+            kernel_preference=weight_config.kernel_preference,
+        ).dequantize(torch.bfloat16)
+        x_2d = x.view(-1, x.shape[-1])
+        if bias:
+            y_ref = torch.addmm(linear.bias, x_2d, w_ref.t()).view(*y.shape)
+        else:
+            y_ref = torch.mm(x_2d, w_ref.t()).view(*y.shape)
+
+        self.assertEqual(y.shape, y_ref.shape)
+        self.assertEqual(y.dtype, y_ref.dtype)
+        torch.testing.assert_close(y, y_ref, rtol=0, atol=0)
+
+        # backward: STE semantics - grad_weight flows through the high
+        # precision input unchanged, grad_input is computed with the fake
+        # quantized weight
+        grad_output = torch.randn(*y.shape, device="cuda", dtype=torch.bfloat16)
+        y.backward(grad_output)
+
+        self.assertIsNotNone(x.grad)
+        self.assertIsNotNone(mx_linear.weight.grad)
+        if bias:
+            self.assertIsNotNone(mx_linear.bias.grad)
+
+        grad_output_2d = grad_output.view(-1, grad_output.shape[-1])
+        grad_input_ref = torch.mm(grad_output_2d, w_ref).view(*x.shape)
+        grad_weight_ref = torch.mm(
+            grad_output_2d.t(), x.detach().view(-1, K)
+        )
+        torch.testing.assert_close(x.grad, grad_input_ref, rtol=0, atol=0)
+        torch.testing.assert_close(
+            mx_linear.weight.grad, grad_weight_ref, rtol=0, atol=0
+        )
+        if bias:
+            torch.testing.assert_close(
+                mx_linear.bias.grad, grad_output_2d.sum(0), rtol=0, atol=0
             )
+
+    @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
+    @parametrize("weight_only", [False, True])
+    def test_mx_qat_end_to_end(self, weight_only):
+        """MX QAT end to end: prepare swaps in MXFakeQuantizedLinear
+        (weight-only when requested, dual-sided otherwise), a training step
+        runs, convert swaps the module back to nn.Linear."""
+        from torchao.prototype.qat import MXFakeQuantizeConfig, MXFakeQuantizedLinear
+
+        M, K, N = 32, 256, 128
+        model = torch.nn.Sequential(
+            torch.nn.Linear(K, N, bias=True, device="cuda", dtype=torch.bfloat16),
+        )
+
+        activation_config = None if weight_only else MXFakeQuantizeConfig()
+        quantize_(
+            model,
+            QATConfig(
+                activation_config=activation_config,
+                weight_config=MXFakeQuantizeConfig(),
+                step="prepare",
+            ),
+        )
+        self.assertIsInstance(model[0], MXFakeQuantizedLinear)
+        if weight_only:
+            self.assertIsNone(model[0].activation_config)
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        model(x).sum().backward()
+        self.assertIsNotNone(model[0].weight.grad)
+
+        quantize_(model, QATConfig(step="convert"))
+        self.assertIsInstance(model[0], torch.nn.Linear)
 
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     @parametrize(

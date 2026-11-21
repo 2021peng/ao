@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
+# Copyright 2026 Arm Limited and/or its affiliates.
+#
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -82,6 +83,13 @@ class _MXQuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
     """
     Autograd function for MX quantization + addmm in low precision during forward,
     and fake quantization in high precision during backward.
+
+    When ``activation_config`` is None (weight-only QAT), the input stays in
+    high precision and the forward pass dequantizes the MX weight and runs a
+    plain high precision matmul; the backward pass keeps the STE semantics of
+    the dual-sided path. In this mode ``kernel_preference`` on the weight
+    config only selects the cast kernel for the weight; the matmul itself is
+    always high precision, since there is no MX x high precision GEMM.
     """
 
     @staticmethod
@@ -91,21 +99,12 @@ class _MXQuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
         _input: torch.Tensor,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
-        activation_config: MXFakeQuantizeConfig,
+        activation_config: Optional[MXFakeQuantizeConfig],
         weight_config: MXFakeQuantizeConfig,
     ) -> torch.Tensor:
         # Handle inputs of any rank by reshaping to 2D
         orig_shape = _input.shape
         _input_2d = _input.view(-1, orig_shape[-1])
-
-        # quantize input activations
-        _input_2d = MXTensor.to_mx(
-            _input_2d,
-            elem_dtype=activation_config.dtype,
-            block_size=activation_config.block_size,
-            scaling_mode=activation_config.scaling_mode,
-            kernel_preference=activation_config.kernel_preference,
-        )
 
         weight = MXTensor.to_mx(
             weight,
@@ -115,21 +114,42 @@ class _MXQuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
             kernel_preference=weight_config.kernel_preference,
         )
 
+        if activation_config is not None:
+            # quantize input activations
+            _input_2d = MXTensor.to_mx(
+                _input_2d,
+                elem_dtype=activation_config.dtype,
+                block_size=activation_config.block_size,
+                scaling_mode=activation_config.scaling_mode,
+                kernel_preference=activation_config.kernel_preference,
+            )
+
+            # Use addmm when bias is present, mm otherwise
+            if bias is not None:
+                aten_op = torch.ops.aten.addmm.default
+            else:
+                aten_op = torch.ops.aten.mm.default
+
+            out = _addmm_mx_dispatch(
+                _input_2d,
+                weight.t(),
+                aten_op,
+                bias,
+            )
+        else:
+            # weight-only: keep activations in high precision, dequantize the
+            # MX weight back to high precision and run a plain matmul, so the
+            # fake quantization numerics of the weight follow `MXTensor` exactly
+            weight_hp = weight.dequantize(weight.orig_dtype)
+            # 2-d matmul mirroring the dispatch above, whose b operand is
+            # already in the right-operand orientation (weight.t())
+            if bias is not None:
+                out = torch.addmm(bias, _input_2d, weight_hp.t())
+            else:
+                out = torch.mm(_input_2d, weight_hp.t())
+
         ctx.save_for_backward(_input_2d, weight)
         ctx.orig_shape = orig_shape
-
-        # Use addmm when bias is present, mm otherwise
-        if bias is not None:
-            aten_op = torch.ops.aten.addmm.default
-        else:
-            aten_op = torch.ops.aten.mm.default
-
-        out = _addmm_mx_dispatch(
-            _input_2d,
-            weight.t(),
-            aten_op,
-            bias,
-        )
 
         # Reshape output back to original shape (with last dim changed)
         out_shape = (*orig_shape[:-1], out.shape[-1])
@@ -140,9 +160,11 @@ class _MXQuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
         _input_2d, weight = ctx.saved_tensors
         orig_shape = ctx.orig_shape
-        assert isinstance(_input_2d, MXTensor)
         assert isinstance(weight, MXTensor)
-        _input_2d = _input_2d.dequantize(_input_2d.orig_dtype)
+        # in the weight-only path the input is saved in high precision
+        # instead of as an MXTensor
+        if isinstance(_input_2d, MXTensor):
+            _input_2d = _input_2d.dequantize(_input_2d.orig_dtype)
         weight = weight.dequantize(weight.orig_dtype)
 
         grad_output_2d = grad_output.view(-1, grad_output.shape[-1])
@@ -163,11 +185,20 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
     in lower precision exactly, while the backward pass uses dequantized
     (fake quantized) values in high precision.
 
+    When only ``weight_config`` is specified, the module runs weight-only
+    QAT: the weight is fake quantized to the MX grid while the activations
+    stay in high precision, and the matmul runs in high precision (so
+    ``kernel_preference`` only selects the weight cast kernel in this
+    mode). The ``convert`` step swaps the module back to a plain
+    ``nn.Linear`` whose weights are still in high precision; quantizing
+    them for inference requires an MX weight-only inference config, which
+    does not exist yet.
 
     Example usage::
 
         from torchao.quantization import quantize_
         from torchao.prototype.mx_formats import MXDynamicActivationMXWeightConfig
+        from torchao.prototype.qat import MXFakeQuantizeConfig
         from torchao.quantization.qat import QATConfig
 
         base_config = MXDynamicActivationMXWeightConfig(
@@ -180,6 +211,16 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
         train_loop(model)
         quantize_(model, QATConfig(base_config, step="convert"))
         # Model contains `nn.Linear` with `MXTensor` weights now
+
+        # Weight-only QAT: only the weight is fake quantized, the
+        # activations stay in high precision (W8A16 / W4A16)
+        quantize_(
+            model, QATConfig(weight_config=MXFakeQuantizeConfig(), step="prepare")
+        )
+        train_loop(model)
+        quantize_(model, QATConfig(step="convert"))
+        # Model contains plain `nn.Linear` again; the weights are still in
+        # high precision (there is no MX weight-only inference config yet)
     """
 
     def __init__(
@@ -201,8 +242,6 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
         )
         if weight_config is None:
             raise ValueError("Must specify `weight_config`")
-        if activation_config is None:
-            raise ValueError("Weight only MX QAT not supported yet")
         self.activation_config = activation_config
         self.weight_config = weight_config
 
@@ -252,3 +291,170 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
             new_linear.weight = mod.weight
             new_linear.bias = mod.bias
         return new_linear
+
+
+class _MXFakeQuantizedConv2dSTE(torch.autograd.Function):
+    """Use fake-quantized values in forward and identity in backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        original: torch.Tensor,
+        fake_quantized: torch.Tensor,
+    ) -> torch.Tensor:
+        return fake_quantized
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+class MXFakeQuantizedConv2d(torch.nn.Conv2d):
+    """Conv2d module with fake-quantized MX weights and activations.
+
+    Activations and weights are fake quantized in blocks along their input
+    channel dimension. The quantized values are dequantized before the
+    convolution, so the convolution itself runs in the original high-precision
+    dtype. As in :class:`MXFakeQuantizedLinear`, the backward pass uses a
+    straight-through estimator.
+
+    The input channels per group must be divisible by both the activation and
+    weight block sizes because ``MXTensor`` does not pad incomplete blocks.
+    The high-precision activation and weight dtypes must be ``torch.float32``
+    or ``torch.bfloat16``, matching ``MXTensor`` support.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        activation_config: Optional[MXFakeQuantizeConfig] = None,
+        weight_config: Optional[MXFakeQuantizeConfig] = None,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+            device=device,
+            dtype=dtype,
+        )
+        if weight_config is None:
+            raise ValueError("Must specify `weight_config`")
+        if activation_config is None:
+            raise ValueError("Weight only MX QAT not supported yet")
+        if self.weight.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                "MXFakeQuantizedConv2d only supports torch.float32 and "
+                f"torch.bfloat16 weights, got {self.weight.dtype}"
+            )
+        if (in_channels // groups) % activation_config.block_size != 0:
+            raise ValueError(
+                "Input channels per group must be divisible by the activation "
+                "block size"
+            )
+        if (in_channels // groups) % weight_config.block_size != 0:
+            raise ValueError(
+                "Input channels per group must be divisible by the weight block size"
+            )
+        self.activation_config = activation_config
+        self.weight_config = weight_config
+
+    @staticmethod
+    @torch.no_grad()
+    def _fake_quantize_input_channel_blocks(
+        tensor: torch.Tensor,
+        config: MXFakeQuantizeConfig,
+    ) -> torch.Tensor:
+        # Both Conv2d inputs (..., C, H, W) and weights (O, I, H, W) have
+        # their input-channel dimension at -3. MXTensor quantizes its last
+        # dimension, so move the channels there temporarily.
+        memory_format = (
+            torch.channels_last
+            if tensor.ndim == 4
+            and tensor.is_contiguous(memory_format=torch.channels_last)
+            else torch.contiguous_format
+        )
+        tensor_channel_last = tensor.movedim(-3, -1).contiguous()
+        tensor_channel_last = MXTensor.to_mx(
+            tensor_channel_last,
+            elem_dtype=config.dtype,
+            block_size=config.block_size,
+            scaling_mode=config.scaling_mode,
+            kernel_preference=config.kernel_preference,
+        ).dequantize(tensor.dtype)
+        return tensor_channel_last.movedim(-1, -3).contiguous(
+            memory_format=memory_format
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        quantized_input = self._fake_quantize_input_channel_blocks(
+            x, self.activation_config
+        )
+        quantized_weight = self._fake_quantize_input_channel_blocks(
+            self.weight, self.weight_config
+        )
+
+        input_ste = _MXFakeQuantizedConv2dSTE.apply(x, quantized_input)
+        weight_ste = _MXFakeQuantizedConv2dSTE.apply(self.weight, quantized_weight)
+        return self._conv_forward(input_ste, weight_ste, self.bias)
+
+    def to_conv2d(self) -> torch.nn.Conv2d:
+        new_conv = torch.nn.Conv2d(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+            self.bias is not None,
+            self.padding_mode,
+            device=self.weight.device,
+            dtype=self.weight.dtype,
+        )
+        if self.weight.device != torch.device("meta"):
+            new_conv.weight = self.weight
+            new_conv.bias = self.bias
+        return new_conv
+
+    @classmethod
+    def from_conv2d(
+        cls,
+        mod: torch.nn.Conv2d,
+        activation_config: Optional[MXFakeQuantizeConfig] = None,
+        weight_config: Optional[MXFakeQuantizeConfig] = None,
+    ) -> "MXFakeQuantizedConv2d":
+        new_conv = cls(
+            mod.in_channels,
+            mod.out_channels,
+            mod.kernel_size,
+            mod.stride,
+            mod.padding,
+            mod.dilation,
+            mod.groups,
+            mod.bias is not None,
+            mod.padding_mode,
+            activation_config=activation_config,
+            weight_config=weight_config,
+            device=mod.weight.device,
+            dtype=mod.weight.dtype,
+        )
+        if mod.weight.device != torch.device("meta"):
+            new_conv.weight = mod.weight
+            new_conv.bias = mod.bias
+        return new_conv
